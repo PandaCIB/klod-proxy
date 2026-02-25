@@ -7,6 +7,8 @@ import ssl
 import sys
 import time
 import threading
+import queue
+import readchar
 from io import StringIO
 from urllib.request import Request, urlopen
 from urllib.error import URLError
@@ -20,8 +22,6 @@ _state_lock = threading.Lock()
 _retry_counter = 0
 _headless = False
 
-if sys.platform == "win32":
-    import msvcrt
 
 # ─── Константы ─────────────────────────────���─────────────────
 LOCAL_PORT = 8080
@@ -513,6 +513,76 @@ def run_proxy_loop():
 
 
 # ─── Ввод ────────────────────────────────────────────────────
+_key_queue = queue.Queue()
+_key_reader_active = False
+
+
+def _key_reader():
+    """Background thread: reads keys and puts them in queue.
+    Uses readchar() + timeout to distinguish bare Esc from arrow sequences."""
+    while True:
+        try:
+            ch = readchar.readchar()
+        except EOFError:
+            break
+        if ch == "\x1b":
+            # Could be bare Esc or start of escape sequence (e.g. \x1b[A for Up)
+            # Wait briefly for more chars
+            import select as _sel
+            if sys.platform == "win32":
+                # On Windows readchar handles this correctly
+                _key_queue.put(ch)
+                continue
+            # On Unix, peek stdin with short timeout
+            try:
+                r, _, _ = _sel.select([sys.stdin], [], [], 0.05)
+            except Exception:
+                r = []
+            if r:
+                # More data available — read the full sequence
+                seq = ch
+                while True:
+                    try:
+                        r2, _, _ = _sel.select([sys.stdin], [], [], 0.01)
+                    except Exception:
+                        break
+                    if not r2:
+                        break
+                    try:
+                        seq += readchar.readchar()
+                    except EOFError:
+                        break
+                _key_queue.put(seq)
+            else:
+                # No more data — bare Esc
+                _key_queue.put("\x1b")
+        else:
+            _key_queue.put(ch)
+
+
+def _start_key_reader():
+    """Start background key reader thread if not already running."""
+    global _key_reader_active
+    if not _key_reader_active:
+        _key_reader_active = True
+        threading.Thread(target=_key_reader, daemon=True).start()
+
+
+def _readkey(timeout: float = None) -> str | None:
+    """Read a key from queue (if reader active) or directly."""
+    if _key_reader_active:
+        try:
+            return _key_queue.get(timeout=timeout if timeout else 86400)
+        except queue.Empty:
+            return None
+    return readchar.readkey()
+
+
+def _is_esc(key: str) -> bool:
+    """Check if key is Escape (single or double \\x1b, but not arrow keys)."""
+    return key.startswith("\x1b") and key not in (readchar.key.UP, readchar.key.DOWN, readchar.key.LEFT, readchar.key.RIGHT, readchar.key.ENTER)
+
+
 def read_line(prompt: str = "", prefill: str = "") -> str:
     if prompt:
         console.print(prompt, end="")
@@ -521,33 +591,29 @@ def read_line(prompt: str = "", prefill: str = "") -> str:
         sys.stdout.write(prefill)
         sys.stdout.flush()
     while True:
-        if msvcrt.kbhit():
-            ch = msvcrt.getwch()
-            if ch in ("\x00", "\xe0"):
-                msvcrt.getwch()  # consume scan code of extended key
-                continue
-            if ch in ("\r", "\n"):
-                print()
-                return "".join(chars).strip()
-            elif ch in ("\x08", "\x7f"):
-                if chars:
-                    chars.pop()
-                    sys.stdout.write("\b \b")
-                    sys.stdout.flush()
-            elif ch == "\x03":
-                raise KeyboardInterrupt
-            else:
-                chars.append(ch)
-                sys.stdout.write(ch)
+        key = _readkey()
+        if key is None:
+            continue
+        if key in (readchar.key.ENTER, "\r", "\n"):
+            print()
+            return "".join(chars).strip()
+        elif key in (readchar.key.BACKSPACE, "\x08", "\x7f"):
+            if chars:
+                chars.pop()
+                sys.stdout.write("\b \b")
                 sys.stdout.flush()
+        elif key == readchar.key.CTRL_C:
+            raise KeyboardInterrupt
+        elif len(key) > 1:
+            continue  # skip special keys (arrows, etc.)
         else:
-            time.sleep(0.02)
+            chars.append(key)
+            sys.stdout.write(key)
+            sys.stdout.flush()
 
 
 def press_any():
-    while not msvcrt.kbhit():
-        time.sleep(0.02)
-    msvcrt.getwch()
+    _readkey()
 
 
 def cls(full: bool = False):
@@ -580,24 +646,21 @@ def select_option(title: str, options: list[str], selected: int = 0) -> int | No
         console.print(f"  [dim]↑↓ select   Enter confirm   Esc cancel[/dim]")
 
         while True:
-            if msvcrt.kbhit():
-                ch = msvcrt.getwch()
-                if ch in ("\x00", "\xe0"):
-                    sc = msvcrt.getwch()
-                    if sc == "H":  # up
-                        idx = (idx - 1) % len(options)
-                        break
-                    elif sc == "P":  # down
-                        idx = (idx + 1) % len(options)
-                        break
-                elif ch in ("\r", "\n"):
-                    return idx
-                elif ch == "\x1b":  # Esc
-                    return None
-                elif ch == "\x03":
-                    raise KeyboardInterrupt
-            else:
-                time.sleep(0.02)
+            key = _readkey()
+            if key is None:
+                continue
+            if key == readchar.key.UP:
+                idx = (idx - 1) % len(options)
+                break
+            elif key == readchar.key.DOWN:
+                idx = (idx + 1) % len(options)
+                break
+            elif key in (readchar.key.ENTER, "\r", "\n"):
+                return idx
+            elif _is_esc(key):
+                return None
+            elif key == readchar.key.CTRL_C:
+                raise KeyboardInterrupt
 
 
 # ─── TUI ─────────────────────────────────────────────────────
@@ -697,17 +760,18 @@ def screen_main():
 
 
 def wait_key() -> str:
-    """Wait for a single keypress, return the character. Ignores extended keys."""
+    """Wait for a single keypress, return the character. Returns ESC as \\x1b."""
     while True:
-        if msvcrt.kbhit():
-            ch = msvcrt.getwch()
-            if ch in ("\x00", "\xe0"):
-                msvcrt.getwch()
-                continue
-            if ch == "\x03":
-                raise KeyboardInterrupt
-            return ch
-        time.sleep(0.02)
+        key = _readkey()
+        if key is None:
+            continue
+        if key == readchar.key.CTRL_C:
+            raise KeyboardInterrupt
+        if _is_esc(key):
+            return "\x1b"
+        if len(key) > 1:
+            continue  # skip special keys
+        return key
 
 
 def screen_providers():
@@ -1098,6 +1162,7 @@ def main():
     refresh_today_tokens()
 
     threading.Thread(target=run_proxy_loop, daemon=True).start()
+    _start_key_reader()
     time.sleep(0.3)
 
     while True:
@@ -1107,18 +1172,15 @@ def main():
             if screen_dirty:
                 screen_dirty = False
                 screen_main()
-            # Анимация ретраев — обновляем каждую секунду
             if active_retries:
-                time.sleep(0.5)
                 screen_main()
-            if msvcrt.kbhit():
-                c = msvcrt.getwch()
-                if c in ("\x00", "\xe0"):
-                    msvcrt.getwch()  # consume scan code of extended key
-                elif c not in ("\r", "\n"):
-                    ch = c
-            else:
-                time.sleep(0.1)
+            key = _readkey(timeout=0.5)
+            if key is None:
+                continue
+            if _is_esc(key):
+                continue  # ignore Esc on main screen
+            if len(key) == 1 and key not in ("\r", "\n"):
+                ch = key
         if ch == "1":
             screen_providers()
             reload_providers()
@@ -1196,7 +1258,7 @@ def cli():
         print("Usage: proxy.py [--headless | add | rm | toggle | list]")
         print()
         print("Commands:")
-        print("  (no args)    Start TUI (Windows)")
+        print("  (no args)    Start TUI")
         print("  --headless   Start proxy without TUI")
         print("  add <name> <url> <key>   Add provider")
         print("  rm <id>                  Remove provider")
