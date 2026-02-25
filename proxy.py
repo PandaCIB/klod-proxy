@@ -525,12 +525,19 @@ def _key_reader():
             ch = readchar.readchar()
         except EOFError:
             break
+        if sys.platform == "win32" and ch in ("\x00", "\xe0"):
+            # Windows special keys: arrow keys etc. are two-byte sequences
+            try:
+                ch2 = readchar.readchar()
+                _key_queue.put(ch + ch2)
+            except EOFError:
+                _key_queue.put(ch)
+            continue
         if ch == "\x1b":
             # Could be bare Esc or start of escape sequence (e.g. \x1b[A for Up)
             # Wait briefly for more chars
             import select as _sel
             if sys.platform == "win32":
-                # On Windows readchar handles this correctly
                 _key_queue.put(ch)
                 continue
             # On Unix, peek stdin with short timeout
@@ -643,7 +650,7 @@ def select_option(title: str, options: list[str], selected: int = 0) -> int | No
             else:
                 console.print(f"  [dim]  {opt}[/dim]")
         console.print()
-        console.print(f"  [dim]↑↓ select   Enter confirm   Esc cancel[/dim]")
+        console.print(f"  [dim]↑↓ select   1-{len(options)} jump   Enter confirm   Esc cancel[/dim]")
 
         while True:
             key = _readkey()
@@ -661,6 +668,10 @@ def select_option(title: str, options: list[str], selected: int = 0) -> int | No
                 return None
             elif key == readchar.key.CTRL_C:
                 raise KeyboardInterrupt
+            elif key.isdigit():
+                num = int(key)
+                if 1 <= num <= len(options):
+                    return num - 1
 
 
 # ─── TUI ─────────────────────────────────────────────────────
