@@ -3,10 +3,13 @@ import json
 import msvcrt
 import os
 import sqlite3
+import ssl
 import sys
 import time
 import threading
 from io import StringIO
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 from aiohttp import web, ClientSession, ClientTimeout
 from rich.console import Console
 from rich.table import Table
@@ -252,6 +255,14 @@ def db_save(model: str, provider_id: int, method: str, path: str, status: int, i
 
 
 # ─── Провайдеры ──────────────────────────────────────────────
+YUNYI_DOMAINS = ("yunyi.cfd", "yunyi.rdzhvip.com", "cdn1.yunyi.cfd", "cdn2.yunyi.cfd")
+
+
+def is_yunyi(prov: dict) -> bool:
+    host = prov["url"].replace("https://", "").replace("http://", "").split("/")[0]
+    return host in YUNYI_DOMAINS
+
+
 def get_active_providers() -> list[dict]:
     return [p for p in providers if p["active"]]
 
@@ -777,6 +788,65 @@ def screen_providers():
                 reload_providers()
 
 
+def fetch_yunyi_stats(prov: dict) -> dict | None:
+    """Fetch stats from yunyi /user/api/v1/me endpoint. Returns parsed JSON or None."""
+    if not is_yunyi(prov):
+        return None
+    url = prov["url"].rstrip("/")
+    for suffix in ("/claude", "/codex"):
+        if url.endswith(suffix):
+            url = url[:-len(suffix)]
+            break
+    try:
+        ctx = ssl.create_default_context()
+        req = Request(f"{url}/user/api/v1/me", headers={
+            "Authorization": f"Bearer {prov['key']}",
+            "User-Agent": "yunyi-activator/1.8.2",
+            "Content-Type": "application/json",
+        })
+        with urlopen(req, timeout=10, context=ctx) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def render_yunyi_stats(prov: dict, data: dict):
+    """Render yunyi provider stats to console."""
+    status = data.get("status", "?")
+    st_color = "green" if status == "active" else "red"
+    billing = data.get("billing_type", "?")
+    console.print(f"    [bright_white]{prov['name']}[/bright_white]  [{st_color}]{status}[/{st_color}]  [dim]{billing}[/dim]")
+
+    ts = data.get("timestamps", {})
+    if ts.get("expires_at"):
+        console.print(f"    [dim]expires:[/dim] {ts['expires_at']}")
+
+    q = data.get("quota", {})
+    if billing == "duration":
+        daily = q.get("daily_quota", 0)
+        spent = q.get("daily_spent", 0)
+        remain = max(0, daily - spent)
+        pct = round(spent / daily * 100) if daily > 0 else 0
+        console.print(f"    [dim]daily:[/dim] {fmt(spent)} / {fmt(daily)}  [dim]remaining:[/dim] [green]{fmt(remain)}[/green]  [dim]({pct}% used)[/dim]")
+    elif billing == "quota":
+        total = q.get("total_quota", 0)
+        remaining = q.get("remaining_quota") if isinstance(q.get("remaining_quota"), (int, float)) else max(0, total - q.get("used_quota", 0))
+        pct = round((total - remaining) / total * 100) if total > 0 else 0
+        console.print(f"    [dim]quota:[/dim] {fmt(int(remaining))} / {fmt(total)}  [dim]({pct}% used)[/dim]")
+    elif billing == "count":
+        total = q.get("max_requests", 0)
+        remaining = q.get("remaining_count") if isinstance(q.get("remaining_count"), (int, float)) else max(0, total - q.get("request_count", 0))
+        pct = round((total - remaining) / total * 100) if total > 0 else 0
+        console.print(f"    [dim]requests:[/dim] {int(remaining)} / {total}  [dim]({pct}% used)[/dim]")
+
+    # Usage stats
+    usage = data.get("usage", {})
+    if usage:
+        reqs = usage.get("request_count", 0)
+        total_tokens = usage.get("total_tokens", 0)
+        console.print(f"    [dim]total tokens:[/dim] [yellow]{fmt(total_tokens)}[/yellow]  [dim]requests:[/dim] {reqs}")
+
+
 def screen_stats():
     cls(full=True)
     console.print()
@@ -840,6 +910,20 @@ def screen_stats():
         for date, inp, out, count in days:
             table.add_row(date, fmt(inp), fmt(out), fmt(inp + out), str(count), bar(inp + out, max_day))
         console.print(table)
+
+    # Yunyi API stats
+    yunyi_provs = [p for p in providers if is_yunyi(p)]
+    if yunyi_provs:
+        console.print()
+        console.print(f"  [bold cyan]API Status[/bold cyan]")
+        console.print()
+        for p in yunyi_provs:
+            data = fetch_yunyi_stats(p)
+            if data:
+                render_yunyi_stats(p, data)
+            else:
+                console.print(f"    [bright_white]{p['name']}[/bright_white]  [red]unavailable[/red]")
+            console.print()
 
     console.print()
     console.print("  [dim]Press any key...[/dim]")
