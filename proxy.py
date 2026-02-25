@@ -874,18 +874,24 @@ def screen_providers():
                 reload_providers()
 
 
-def fetch_yunyi_stats(prov: dict) -> dict | None:
-    """Fetch stats from yunyi /user/api/v1/me endpoint. Returns parsed JSON or None."""
-    if not is_yunyi(prov):
-        return None
+def _yunyi_base_url(prov: dict) -> str:
+    """Strip /claude or /codex suffix to get yunyi base URL."""
     url = prov["url"].rstrip("/")
     for suffix in ("/claude", "/codex"):
         if url.endswith(suffix):
             url = url[:-len(suffix)]
             break
+    return url
+
+
+def fetch_yunyi_stats(prov: dict) -> dict | None:
+    """Fetch stats from yunyi /user/api/v1/me endpoint. Returns parsed JSON or None."""
+    if not is_yunyi(prov):
+        return None
+    base_url = _yunyi_base_url(prov)
     try:
         ctx = ssl.create_default_context()
-        req = Request(f"{url}/user/api/v1/me", headers={
+        req = Request(f"{base_url}/user/api/v1/me", headers={
             "Authorization": f"Bearer {prov['key']}",
             "User-Agent": "yunyi-activator/1.8.2",
             "Content-Type": "application/json",
@@ -925,7 +931,6 @@ def render_yunyi_stats(prov: dict, data: dict):
         pct = round((total - remaining) / total * 100) if total > 0 else 0
         console.print(f"    [dim]requests:[/dim] {int(remaining)} / {total}  [dim]({pct}% used)[/dim]")
 
-    # Usage stats
     usage = data.get("usage", {})
     if usage:
         reqs = usage.get("request_count", 0)
