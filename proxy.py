@@ -13,7 +13,7 @@ import readchar
 from io import StringIO
 from urllib.request import Request, urlopen
 from urllib.error import URLError
-from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp import web, ClientSession, ClientTimeout, ClientError
 from rich.console import Console
 from rich.table import Table
 
@@ -32,6 +32,7 @@ STRIP_RESP_HEADERS = ("Transfer-Encoding", "Connection", "Content-Encoding")
 RETRY_DELAY = 5
 _KEYS_UP = {readchar.key.UP, "\xe0H"}
 _KEYS_DOWN = {readchar.key.DOWN, "\xe0P"}
+_ssl_ctx = ssl.create_default_context()
 
 # ─── Состояние ───────────────────────────────────────────────
 console = Console()
@@ -68,15 +69,17 @@ def refresh_today_tokens():
     now = time.time()
     # Обновляем каждую минуту
     current_slot = int(now) // 60
-    cached_slot = int(today_cache_time) // 60 if today_cache_time else -1
+    with _token_lock:
+        cached_slot = int(today_cache_time) // 60 if today_cache_time else -1
     if current_slot == cached_slot:
         return
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log WHERE DATE(ts) = DATE('now')"
         ).fetchone()
-    today_input_tokens, today_output_tokens = row[0], row[1]
-    today_cache_time = now  # флаг для перерисовки из async-потока
+    with _token_lock:
+        today_input_tokens, today_output_tokens = row[0], row[1]
+        today_cache_time = now
 
 
 def log_error(msg: str, style: str = "red"):
@@ -99,7 +102,8 @@ def init_db():
                 name TEXT NOT NULL,
                 url TEXT NOT NULL,
                 key TEXT NOT NULL,
-                active INTEGER DEFAULT 1
+                active INTEGER DEFAULT 1,
+                expired INTEGER DEFAULT 0
             )
         """)
         conn.execute("""
@@ -116,11 +120,15 @@ def init_db():
             )
         """)
         # миграции
-        for col, default in [("model", "''"), ("provider_id", "0")]:
+        for col, col_type, default in [("model", "TEXT", "''"), ("provider_id", "INTEGER", "0")]:
             try:
                 conn.execute(f"SELECT {col} FROM token_log LIMIT 1")
             except sqlite3.OperationalError:
-                conn.execute(f"ALTER TABLE token_log ADD COLUMN {col} TEXT DEFAULT {default}")
+                conn.execute(f"ALTER TABLE token_log ADD COLUMN {col} {col_type} DEFAULT {default}")
+        try:
+            conn.execute("SELECT expired FROM providers LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE providers ADD COLUMN expired INTEGER DEFAULT 0")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -132,8 +140,8 @@ def init_db():
 
 def db_load_providers() -> list[dict]:
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT id, name, url, key, active FROM providers ORDER BY id").fetchall()
-    return [{"id": r[0], "name": r[1], "url": r[2], "key": r[3], "active": bool(r[4])} for r in rows]
+        rows = conn.execute("SELECT id, name, url, key, active, expired FROM providers ORDER BY id").fetchall()
+    return [{"id": r[0], "name": r[1], "url": r[2], "key": r[3], "active": bool(r[4]), "expired": bool(r[5])} for r in rows]
 
 
 def db_add_provider(name: str, url: str, key: str):
@@ -156,7 +164,7 @@ def db_toggle_provider(pid: int):
 
 def db_edit_provider(pid: int, name: str, url: str, key: str):
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE providers SET name=?, url=?, key=? WHERE id=?", (name, url, key, pid))
+        conn.execute("UPDATE providers SET name=?, url=?, key=?, expired=0 WHERE id=?", (name, url, key, pid))
         conn.commit()
 
 
@@ -261,7 +269,7 @@ def is_yunyi(prov: dict) -> bool:
 
 
 def get_active_providers() -> list[dict]:
-    return [p for p in providers if p["active"]]
+    return [p for p in providers if p["active"] and not p.get("expired")]
 
 
 def current_provider() -> dict | None:
@@ -324,7 +332,9 @@ def extract_tokens(data: dict, ctx: dict):
 
     usage = data.get("usage")
     if usage:
-        delta_inp += usage.get("input_tokens", 0)
+        # top-level usage may duplicate message.usage input_tokens — only take output here
+        if not delta_inp:
+            delta_inp += usage.get("input_tokens", 0)
         delta_out += usage.get("output_tokens", 0)
 
     if delta_inp or delta_out:
@@ -379,6 +389,14 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     retry_id = None
 
     while True:
+        # Refresh active providers on retry rounds
+        if tried == 0 and retry_count > 0:
+            active = get_active_providers()
+            total_active = len(active)
+            if not active:
+                log_error("No active providers configured", "yellow")
+                return web.Response(status=503, text="No active providers configured")
+
         with _state_lock:
             _mode = proxy_mode
             _single_id = single_provider_id
@@ -404,97 +422,146 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         headers["x-api-key"] = prov["key"]
         ctx = {"inp": 0, "out": 0, "model": ""}
 
-        async with client_session.request(method=method, url=target_url, headers=headers, data=body, ssl=ssl.create_default_context()) as resp:
-            if resp.status >= 400:
-                err_body = await resp.read()
-                err_text = err_body.decode("utf-8", errors="replace")
+        try:
+            async with client_session.request(method=method, url=target_url, headers=headers, data=body, ssl=_ssl_ctx) as resp:
+                if resp.status >= 400:
+                    err_body = await resp.read()
+                    err_text = err_body.decode("utf-8", errors="replace")
 
-                is_retryable = (
-                    (resp.status == 500 and "no avail" in err_text.lower())
-                    or (resp.status == 503)
-                    or ("e015" in err_text.lower())
-                )
-                if is_retryable:
-                    # Try next provider first
-                    advance_provider()
-                    tried += 1
-
-                    if tried < total_active:
-                        log_error(f"{prov['name']}: unavailable, switching to next provider", "yellow")
+                    is_expired = resp.status == 401 and "expired" in err_text.lower()
+                    if is_expired:
+                        prov["expired"] = True
+                        with sqlite3.connect(DB_PATH) as conn:
+                            conn.execute("UPDATE providers SET expired = 1 WHERE id = ?", (prov["id"],))
+                        log_error(f"{prov['name']}: API key expired", "yellow")
                         screen_dirty = True
+                        advance_provider()
+                        tried += 1
+                        if tried < total_active:
+                            continue
+                        return web.Response(status=resp.status, headers={k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS}, body=err_body)
+
+                    is_retryable = (
+                        (resp.status == 500 and "no avail" in err_text.lower())
+                        or (resp.status == 503)
+                        or ("e015" in err_text.lower())
+                    )
+                    if is_retryable:
+                        # Try next provider first
+                        advance_provider()
+                        tried += 1
+
+                        if tried < total_active:
+                            log_error(f"{prov['name']}: unavailable, switching to next provider", "yellow")
+                            screen_dirty = True
+                            continue
+
+                        # All providers tried — start retry cycle
+                        tried = 0
+                        if retry_count == 0:
+                            retry_start = time.time()
+                            retry_ts = time.strftime("%H:%M:%S")
+                            with _log_lock:
+                                global _retry_counter
+                                _retry_counter += 1
+                                retry_id = _retry_counter
+                                error_log.append("")
+                                _trim_error_log()
+                                active_retries[retry_id] = {
+                                    "provider": "all", "count": 0, "start": retry_start,
+                                    "ts": retry_ts, "log_idx": len(error_log) - 1,
+                                }
+                        retry_count += 1
+                        with _log_lock:
+                            info = active_retries[retry_id]
+                            info["count"] = retry_count
+                            idx = info["log_idx"]
+                            if 0 <= idx < len(error_log):
+                                elapsed = int(time.time() - retry_start)
+                                error_log[idx] = f"[yellow][{info['ts']}] ⟳ all providers unavailable: retry round #{retry_count} ({elapsed}s)[/yellow]"
+                        screen_dirty = True
+                        await asyncio.sleep(RETRY_DELAY)
                         continue
 
-                    # All providers tried — start retry cycle
-                    tried = 0
-                    if retry_count == 0:
-                        retry_start = time.time()
-                        retry_ts = time.strftime("%H:%M:%S")
-                        with _log_lock:
-                            global _retry_counter
-                            _retry_counter += 1
-                            retry_id = _retry_counter
-                            error_log.append("")
-                            _trim_error_log()
-                            active_retries[retry_id] = {
-                                "provider": "all", "count": 0, "start": retry_start,
-                                "ts": retry_ts, "log_idx": len(error_log) - 1,
-                            }
-                    retry_count += 1
+                    log_error(f"{resp.status} {prov['name']}: {err_text[:80]}")
+                    return web.Response(
+                        status=resp.status,
+                        headers={k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS},
+                        body=err_body,
+                    )
+
+                # Success — clear retry info if any
+                if retry_count > 0:
+                    elapsed = int(time.time() - retry_start)
                     with _log_lock:
-                        info = active_retries[retry_id]
-                        info["count"] = retry_count
-                        idx = info["log_idx"]
-                        if 0 <= idx < len(error_log):
-                            elapsed = int(time.time() - retry_start)
-                            error_log[idx] = f"[yellow][{info['ts']}] ⟳ all providers unavailable: retry round #{retry_count} ({elapsed}s)[/yellow]"
+                        info = active_retries.pop(retry_id, None)
+                        if info:
+                            idx = info["log_idx"]
+                            if 0 <= idx < len(error_log):
+                                error_log[idx] = f"[green][{info['ts']}] ✓ {prov['name']}: OK after {retry_count} retry rounds ({elapsed}s)[/green]"
                     screen_dirty = True
-                    await asyncio.sleep(RETRY_DELAY)
-                    continue
 
-                log_error(f"{resp.status} {prov['name']}: {err_text[:80]}")
-                return web.Response(
-                    status=resp.status,
-                    headers={k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS},
-                    body=err_body,
-                )
+                is_stream = "text/event-stream" in resp.headers.get("Content-Type", "")
+                resp_headers = {k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS}
 
-            # Success — clear retry info if any
-            if retry_count > 0:
-                elapsed = int(time.time() - retry_start)
-                with _log_lock:
-                    info = active_retries.pop(retry_id, None)
-                    if info:
-                        idx = info["log_idx"]
-                        if 0 <= idx < len(error_log):
-                            error_log[idx] = f"[green][{info['ts']}] ✓ {prov['name']}: OK after {retry_count} retry rounds ({elapsed}s)[/green]"
+                if is_stream:
+                    stream_resp = web.StreamResponse(status=resp.status, headers=resp_headers)
+                    try:
+                        await stream_resp.prepare(request)
+                        sse_buf = []
+                        async for chunk in resp.content.iter_any():
+                            parse_sse_chunk(chunk, sse_buf, ctx)
+                            await stream_resp.write(chunk)
+                        await stream_resp.write_eof()
+                    except (ConnectionResetError, ConnectionError, BrokenPipeError, ClientError):
+                        pass
+                    if ctx["inp"] or ctx["out"]:
+                        await loop.run_in_executor(None, db_save, ctx["model"], prov["id"], method, path, resp.status, ctx["inp"], ctx["out"])
+                    return stream_resp
+                else:
+                    resp_body = await resp.read()
+                    try:
+                        extract_tokens(json.loads(resp_body), ctx)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    if ctx["inp"] or ctx["out"]:
+                        await loop.run_in_executor(None, db_save, ctx["model"], prov["id"], method, path, resp.status, ctx["inp"], ctx["out"])
+                    return web.Response(status=resp.status, headers=resp_headers, body=resp_body)
+        except (ClientError, asyncio.TimeoutError, OSError) as e:
+            # Network error — treat as retryable
+            advance_provider()
+            tried += 1
+            if tried < total_active:
+                log_error(f"{prov['name']}: {type(e).__name__}, switching to next provider", "yellow")
                 screen_dirty = True
-
-            is_stream = "text/event-stream" in resp.headers.get("Content-Type", "")
-            resp_headers = {k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS}
-
-            if is_stream:
-                stream_resp = web.StreamResponse(status=resp.status, headers=resp_headers)
-                try:
-                    await stream_resp.prepare(request)
-                    sse_buf = []
-                    async for chunk in resp.content.iter_any():
-                        parse_sse_chunk(chunk, sse_buf, ctx)
-                        await stream_resp.write(chunk)
-                    await stream_resp.write_eof()
-                except (ConnectionResetError, ConnectionError, BrokenPipeError):
-                    pass
-                if ctx["inp"] or ctx["out"]:
-                    await loop.run_in_executor(None, db_save, ctx["model"], prov["id"], method, path, resp.status, ctx["inp"], ctx["out"])
-                return stream_resp
-            else:
-                resp_body = await resp.read()
-                try:
-                    extract_tokens(json.loads(resp_body), ctx)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                if ctx["inp"] or ctx["out"]:
-                    await loop.run_in_executor(None, db_save, ctx["model"], prov["id"], method, path, resp.status, ctx["inp"], ctx["out"])
-                return web.Response(status=resp.status, headers=resp_headers, body=resp_body)
+                continue
+            tried = 0
+            if retry_count == 0:
+                retry_start = time.time()
+                retry_ts = time.strftime("%H:%M:%S")
+                with _log_lock:
+                    _retry_counter += 1
+                    retry_id = _retry_counter
+                    error_log.append("")
+                    _trim_error_log()
+                    active_retries[retry_id] = {
+                        "provider": "all", "count": 0, "start": retry_start,
+                        "ts": retry_ts, "log_idx": len(error_log) - 1,
+                    }
+            retry_count += 1
+            with _log_lock:
+                info = active_retries[retry_id]
+                info["count"] = retry_count
+                idx = info["log_idx"]
+                if 0 <= idx < len(error_log):
+                    elapsed = int(time.time() - retry_start)
+                    error_log[idx] = f"[yellow][{info['ts']}] ⟳ all providers unavailable: retry round #{retry_count} ({elapsed}s)[/yellow]"
+            screen_dirty = True
+            await asyncio.sleep(RETRY_DELAY)
+            continue
+        except Exception as e:
+            log_error(f"{prov['name']}: unexpected {type(e).__name__}: {e}")
+            return web.Response(status=502, body=b"Bad Gateway")
 
 
 # ─── Сервер ──────────────────────────────────────────────────
@@ -743,16 +810,21 @@ def screen_main():
         cur_id = cur["id"] if cur else None
         totals_map = db_load_totals_all()
         for p in _providers:
-            if p["active"]:
+            if p.get("expired"):
+                marker = "[bold yellow]●[/bold yellow]"
+                status_tag = " [yellow]expired[/yellow]"
+            elif p["active"]:
                 marker = "[bold bright_green]●[/bold bright_green]"
+                status_tag = ""
             else:
                 marker = "[bold bright_red]●[/bold bright_red]"
+                status_tag = ""
             arrow = " [bright_yellow]◄[/bright_yellow]" if p["id"] == cur_id else ""
             t_inp, t_out = totals_map.get(p["id"], (0, 0))
             tokens = fmt(t_inp + t_out)
             # short url: just host
             short_url = p["url"].replace("https://", "").replace("http://", "").split("/")[0]
-            _p(f"    {marker} [bright_white]{p['name']}[/bright_white]  [dim]{short_url}[/dim]  [yellow]{tokens}[/yellow]{arrow}")
+            _p(f"    {marker} [bright_white]{p['name']}[/bright_white]{status_tag}  [dim]{short_url}[/dim]  [yellow]{tokens}[/yellow]{arrow}")
         _p()
     s_inp = fmt(_today_inp).rjust(8)
     s_out = fmt(_today_out).rjust(8)
@@ -1062,7 +1134,7 @@ def screen_stats():
 
 
 def screen_settings():
-    global LOCAL_PORT, proxy_mode, single_provider_id
+    global proxy_mode, single_provider_id
     while True:
         cls(full=True)
         console.print()
@@ -1095,9 +1167,8 @@ def screen_settings():
             show_cursor()
             val = read_line("  New port: ")
             if val.isdigit():
-                LOCAL_PORT = int(val)
-                db_set_setting("port", str(LOCAL_PORT))
-                console.print("  [yellow]Restart proxy to apply.[/yellow]")
+                db_set_setting("port", val)
+                console.print(f"  [yellow]Saved port {val}. Restart proxy to apply.[/yellow]")
                 press_any()
         elif ch == "2":
             modes = ["sticky", "round-robin", "single"]
@@ -1158,7 +1229,8 @@ def main_headless():
         loop.call_soon_threadsafe(loop.stop)
 
     signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    if sys.platform != "win32":
+        signal.signal(signal.SIGTERM, _shutdown)
 
     loop.run_until_complete(start_server())
     loop.run_forever()
@@ -1272,16 +1344,26 @@ def cli():
             print("Usage: proxy.py rm <id>")
             sys.exit(1)
         init_db()
-        db_remove_provider(int(args[1]))
-        print(f"Removed provider #{args[1]}")
+        try:
+            pid = int(args[1])
+        except ValueError:
+            print(f"Error: '{args[1]}' is not a valid provider ID")
+            sys.exit(1)
+        db_remove_provider(pid)
+        print(f"Removed provider #{pid}")
 
     elif cmd == "toggle":
         if len(args) < 2:
             print("Usage: proxy.py toggle <id>")
             sys.exit(1)
         init_db()
-        db_toggle_provider(int(args[1]))
-        print(f"Toggled provider #{args[1]}")
+        try:
+            pid = int(args[1])
+        except ValueError:
+            print(f"Error: '{args[1]}' is not a valid provider ID")
+            sys.exit(1)
+        db_toggle_provider(pid)
+        print(f"Toggled provider #{pid}")
 
     elif cmd == "list":
         init_db()

@@ -25,7 +25,7 @@ def main():
 
     # 1. Зависимости
     step("Installing dependencies...")
-    r = run(f'"{sys.executable}" -m pip install aiohttp rich --quiet')
+    r = run(f'"{sys.executable}" -m pip install aiohttp rich readchar --quiet')
     if r.returncode == 0:
         print("    OK")
     else:
