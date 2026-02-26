@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import signal
+import socket
 import sqlite3
 import ssl
 import sys
@@ -29,6 +30,8 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "klod.db")
 HOP_HEADERS = ("Transfer-Encoding", "Connection", "Keep-Alive", "Upgrade")
 STRIP_RESP_HEADERS = ("Transfer-Encoding", "Connection", "Content-Encoding")
 RETRY_DELAY = 5
+_KEYS_UP = {readchar.key.UP, "\xe0H"}
+_KEYS_DOWN = {readchar.key.DOWN, "\xe0P"}
 
 # ─── Состояние ───────────────────────────────────────────────
 console = Console()
@@ -47,6 +50,7 @@ today_cache_time = 0
 # Активные ретраи: {retry_id: {"provider": str, "count": int, "start": float, "log_idx": int}}
 active_retries: dict[int, dict] = {}
 proxy_mode = "sticky"  # "sticky" | "round-robin" | "single"
+_proxy_online = False
 single_provider_id: int = 0
 client_session: ClientSession = None
 
@@ -62,9 +66,9 @@ def _trim_error_log():
 def refresh_today_tokens():
     global today_input_tokens, today_output_tokens, today_cache_time
     now = time.time()
-    # Обновляем в фиксированные 5-минутные слоты (xx:00, xx:05, xx:10, ...)
-    current_slot = int(now) // 300
-    cached_slot = int(today_cache_time) // 300 if today_cache_time else -1
+    # Обновляем каждую минуту
+    current_slot = int(now) // 60
+    cached_slot = int(today_cache_time) // 60 if today_cache_time else -1
     if current_slot == cached_slot:
         return
     with sqlite3.connect(DB_PATH) as conn:
@@ -381,6 +385,11 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         if _mode == "single":
             prov = next((p for p in active if p["id"] == _single_id), None)
             if not prov:
+                all_prov = next((p for p in providers if p["id"] == _single_id), None)
+                if all_prov and not all_prov["active"]:
+                    msg = f"Provider '{all_prov['name']}' is disabled. Change mode in Settings or enable the provider."
+                    log_error(msg, "yellow")
+                    return web.Response(status=503, text=msg)
                 log_error(f"Single provider #{_single_id} not found or inactive", "yellow")
                 return web.Response(status=503, text="Selected provider not available")
         elif _mode == "sticky":
@@ -400,7 +409,12 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 err_body = await resp.read()
                 err_text = err_body.decode("utf-8", errors="replace")
 
-                if resp.status == 500 and "no avail" in err_text.lower():
+                is_retryable = (
+                    (resp.status == 500 and "no avail" in err_text.lower())
+                    or (resp.status == 503)
+                    or ("e015" in err_text.lower())
+                )
+                if is_retryable:
                     # Try next provider first
                     advance_provider()
                     tried += 1
@@ -485,7 +499,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
 # ─── Сервер ──────────────────────────────────────────────────
 async def start_server():
-    global runner, client_session
+    global runner, client_session, _proxy_online
     client_session = ClientSession(timeout=ClientTimeout(total=300, sock_read=300))
     app = web.Application()
     app.router.add_route("*", "/{path_info:.*}", proxy_handler)
@@ -493,6 +507,7 @@ async def start_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", LOCAL_PORT)
     await site.start()
+    _proxy_online = True
 
 
 async def stop_server():
@@ -656,10 +671,10 @@ def select_option(title: str, options: list[str], selected: int = 0) -> int | No
             key = _readkey()
             if key is None:
                 continue
-            if key == readchar.key.UP:
+            if key in _KEYS_UP:
                 idx = (idx - 1) % len(options)
                 break
-            elif key == readchar.key.DOWN:
+            elif key in _KEYS_DOWN:
                 idx = (idx + 1) % len(options)
                 break
             elif key in (readchar.key.ENTER, "\r", "\n"):
@@ -699,8 +714,7 @@ def screen_main():
         buf.write("\033[K\n")
 
     refresh_today_tokens()
-    is_online = loop and loop.is_running()
-    status = "[on green] [/on green] [bold green]Online[/bold green]" if is_online else "[on red] [/on red] [bold red]Offline[/bold red]"
+    status = "[on green] [/on green] [bold green]Online[/bold green]" if _proxy_online else "[on red] [/on red] [bold red]Offline[/bold red]"
     with _state_lock:
         _providers = list(providers)
         _proxy_mode = proxy_mode
@@ -732,7 +746,7 @@ def screen_main():
             if p["active"]:
                 marker = "[bold bright_green]●[/bold bright_green]"
             else:
-                marker = "[dim]○[/dim]"
+                marker = "[bold bright_red]●[/bold bright_red]"
             arrow = " [bright_yellow]◄[/bright_yellow]" if p["id"] == cur_id else ""
             t_inp, t_out = totals_map.get(p["id"], (0, 0))
             tokens = fmt(t_inp + t_out)
@@ -1174,6 +1188,13 @@ def main():
     single_provider_id = int(db_get_setting("single_provider_id", "0"))
     LOCAL_PORT = int(db_get_setting("port", str(LOCAL_PORT)))
 
+    # Check if port is already in use (another instance running)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(("127.0.0.1", LOCAL_PORT)) == 0:
+            console.print(f"\n  [bold red]Port {LOCAL_PORT} is already in use.[/bold red]")
+            console.print(f"  [dim]Another instance of Klod Proxy is likely running.[/dim]\n")
+            sys.exit(1)
+
     total_input_tokens, total_output_tokens = db_load_totals()
     refresh_today_tokens()
 
@@ -1184,9 +1205,12 @@ def main():
     while True:
         screen_main()
         ch = None
+        last_refresh = time.time()
         while ch is None:
-            if screen_dirty:
+            now = time.time()
+            if screen_dirty or now - last_refresh >= 60:
                 screen_dirty = False
+                last_refresh = now
                 screen_main()
             if active_retries:
                 screen_main()
