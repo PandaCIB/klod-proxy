@@ -528,7 +528,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                             info["next_retry"] = time.time() + delay
                             idx = info["log_idx"]
                             if 0 <= idx < len(error_log):
-                                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retry #{retry_count}, next in {delay}s[/yellow]"
+                                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retry #{retry_count} ({delay}s)[/yellow]"
                         screen_dirty = True
                         await asyncio.sleep(delay)
                         continue
@@ -614,7 +614,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 info["next_retry"] = time.time() + delay
                 idx = info["log_idx"]
                 if 0 <= idx < len(error_log):
-                    error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retry #{retry_count}, next in {delay}s[/yellow]"
+                    error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retry #{retry_count} ({delay}s)[/yellow]"
             screen_dirty = True
             await asyncio.sleep(delay)
             continue
@@ -910,7 +910,7 @@ def screen_main():
                 next_retry = info.get("next_retry", 0)
                 countdown = max(0, int(next_retry - time.time()))
                 dots = "." * ((countdown % 3) + 1) + " " * (2 - (countdown % 3))
-                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info.get('provider', 'all')}: {info.get('reason', 'unavailable')}: retry #{info['count']}, next in {countdown}s{dots}[/yellow]"
+                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info.get('provider', 'all')}: {info.get('reason', 'unavailable')}: retry #{info['count']} ({countdown}s){dots}[/yellow]"
         log_snapshot = list(error_log[-10:])
     if log_snapshot:
         _p(f"  [bold red]── Log ──[/bold red]")
