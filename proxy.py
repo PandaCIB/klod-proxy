@@ -452,6 +452,15 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                     err_body = await resp.read()
                     err_text = err_body.decode("utf-8", errors="replace")
 
+                    # Extract message from JSON if possible
+                    try:
+                        err_json = json.loads(err_text)
+                        if isinstance(err_json, dict) and "error" in err_json:
+                            if isinstance(err_json["error"], dict) and "message" in err_json["error"]:
+                                err_text = err_json["error"]["message"]
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        pass  # Keep original err_text
+
                     is_expired = resp.status == 401 and "expired" in err_text.lower()
                     if is_expired:
                         prov["expired"] = True
