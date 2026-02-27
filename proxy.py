@@ -905,7 +905,7 @@ def screen_main():
             _p(f"  {line}")
         _p()
     _p(f"  [dim]{'-' * 46}[/dim]")
-    _p(f"  [bold bright_cyan](1)[/bold bright_cyan] Providers  [dim]|[/dim]  [bold bright_green](2)[/bold bright_green] Stats  [dim]|[/dim]  [bold bright_yellow](3)[/bold bright_yellow] Settings  [dim]|[/dim]  [bold red](0)[/bold red] Clear")
+    _p(f"  [bold bright_cyan](1)[/bold bright_cyan] Providers  [dim]|[/dim]  [bold bright_green](2)[/bold bright_green] Stats  [dim]|[/dim]  [bold bright_yellow](3)[/bold bright_yellow] Mode  [dim]|[/dim]  [bold red](0)[/bold red] Clear")
     _p()
 
     # Один write — ноль мерцания
