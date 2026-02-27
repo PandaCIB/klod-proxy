@@ -51,7 +51,7 @@ today_output_tokens = 0
 today_cache_time = 0
 # Активные ретраи: {retry_id: {"provider": str, "count": int, "start": float, "log_idx": int}}
 active_retries: dict[int, dict] = {}
-proxy_mode = "failover"  # "failover" | "round-robin" | "single"
+proxy_mode = "failover-robin"  # "failover-robin" | "round-robin" | "single"
 _proxy_online = False
 single_provider_id: int = 0
 client_session: ClientSession = None
@@ -290,7 +290,7 @@ def get_active_providers() -> list[dict]:
 
 
 def current_provider() -> dict | None:
-    """Return current failover provider without advancing index."""
+    """Return current failover-robin provider without advancing index."""
     with _state_lock:
         active = get_active_providers()
         if not active:
@@ -427,7 +427,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                     return web.Response(status=503, text=msg)
                 log_error(f"Single provider #{_single_id} not found or inactive", "yellow")
                 return web.Response(status=503, text="Selected provider not available")
-        elif _mode == "failover":
+        elif _mode == "failover-robin":
             prov = current_provider()
         else:
             prov = next_provider()
@@ -1282,8 +1282,8 @@ def screen_settings():
         with _state_lock:
             _mode = proxy_mode
             _single_id = single_provider_id
-        if _mode == "failover":
-            mode_label = "[green]failover[/green]"
+        if _mode == "failover-robin":
+            mode_label = "[green]failover-robin[/green]"
         elif _mode == "round-robin":
             mode_label = "[cyan]round-robin[/cyan]"
         else:
@@ -1293,7 +1293,7 @@ def screen_settings():
         console.print(f"  [bold bright_cyan](1)[/bold bright_cyan] Port       [bold]{LOCAL_PORT}[/bold]")
         console.print(f"  [bold bright_green](2)[/bold bright_green] Mode       {mode_label}")
         console.print()
-        console.print(f"  [dim]  failover    — один провайдер, пока работает. При ошибке — следующий[/dim]")
+        console.print(f"  [dim]  failover-robin — один провайдер, пока работает. При ошибке — следующий[/dim]")
         console.print(f"  [dim]  round-robin — каждый запрос к следующему провайдеру по кругу[/dim]")
         console.print(f"  [dim]  single      — только один конкретный провайдер[/dim]")
         console.print()
@@ -1310,7 +1310,7 @@ def screen_settings():
                 console.print(f"  [yellow]Saved port {val}. Restart proxy to apply.[/yellow]")
                 press_any()
         elif ch == "2":
-            modes = ["failover", "round-robin", "single"]
+            modes = ["failover-robin", "round-robin", "single"]
             with _state_lock:
                 cur_mode = proxy_mode
                 cur_single = single_provider_id
@@ -1348,13 +1348,13 @@ def main_headless():
     reload_providers()
     old_sticky = db_get_setting("sticky_mode", "")
     if old_sticky and not db_get_setting("proxy_mode", ""):
-        db_set_setting("proxy_mode", "failover" if old_sticky == "1" else "round-robin")
-    proxy_mode = db_get_setting("proxy_mode", "failover")
-    if proxy_mode == "sticky":
-        proxy_mode = "failover"
-        db_set_setting("proxy_mode", "failover")
-    if proxy_mode not in ("failover", "round-robin", "single"):
-        proxy_mode = "failover"
+        db_set_setting("proxy_mode", "failover-robin" if old_sticky == "1" else "round-robin")
+    proxy_mode = db_get_setting("proxy_mode", "failover-robin")
+    if proxy_mode in ("sticky", "failover"):
+        proxy_mode = "failover-robin"
+        db_set_setting("proxy_mode", "failover-robin")
+    if proxy_mode not in ("failover-robin", "round-robin", "single"):
+        proxy_mode = "failover-robin"
     single_provider_id = int(db_get_setting("single_provider_id", "0"))
     LOCAL_PORT = int(db_get_setting("port", str(LOCAL_PORT)))
     total_input_tokens, total_output_tokens = db_load_totals()
@@ -1395,13 +1395,13 @@ def main():
     # Миграция: sticky_mode → proxy_mode
     old_sticky = db_get_setting("sticky_mode", "")
     if old_sticky and not db_get_setting("proxy_mode", ""):
-        db_set_setting("proxy_mode", "failover" if old_sticky == "1" else "round-robin")
-    proxy_mode = db_get_setting("proxy_mode", "failover")
-    if proxy_mode == "sticky":
-        proxy_mode = "failover"
-        db_set_setting("proxy_mode", "failover")
-    if proxy_mode not in ("failover", "round-robin", "single"):
-        proxy_mode = "failover"
+        db_set_setting("proxy_mode", "failover-robin" if old_sticky == "1" else "round-robin")
+    proxy_mode = db_get_setting("proxy_mode", "failover-robin")
+    if proxy_mode in ("sticky", "failover"):
+        proxy_mode = "failover-robin"
+        db_set_setting("proxy_mode", "failover-robin")
+    if proxy_mode not in ("failover-robin", "round-robin", "single"):
+        proxy_mode = "failover-robin"
     single_provider_id = int(db_get_setting("single_provider_id", "0"))
     LOCAL_PORT = int(db_get_setting("port", str(LOCAL_PORT)))
 
