@@ -30,10 +30,17 @@ LOCAL_PORT = 8080
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "klod.db")
 HOP_HEADERS = ("Transfer-Encoding", "Connection", "Keep-Alive", "Upgrade")
 STRIP_RESP_HEADERS = ("Transfer-Encoding", "Connection", "Content-Encoding")
-RETRY_DELAY = 5
 _KEYS_UP = {readchar.key.UP, "\xe0H"}
 _KEYS_DOWN = {readchar.key.DOWN, "\xe0P"}
 _ssl_ctx = ssl.create_default_context()
+
+
+def get_retry_delay(retry_count: int) -> int:
+    """Calculate retry delay with exponential backoff: 1, 3, 5, 10, 15+ seconds."""
+    delays = [1, 3, 5, 10, 15]
+    if retry_count <= len(delays):
+        return delays[retry_count - 1]
+    return 15
 
 # ─── Состояние ───────────────────────────────────────────────
 console = Console()
@@ -501,15 +508,16 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                                     "ts": retry_ts, "reason": reason, "log_idx": len(error_log) - 1,
                                 }
                         retry_count += 1
+                        delay = get_retry_delay(retry_count)
                         with _log_lock:
                             info = active_retries[retry_id]
                             info["count"] = retry_count
+                            info["next_retry"] = time.time() + delay
                             idx = info["log_idx"]
                             if 0 <= idx < len(error_log):
-                                elapsed = int(time.time() - retry_start)
-                                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retrying #{retry_count} ({elapsed}s)[/yellow]"
+                                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retry #{retry_count}, next in {delay}s[/yellow]"
                         screen_dirty = True
-                        await asyncio.sleep(RETRY_DELAY)
+                        await asyncio.sleep(delay)
                         continue
 
                     log_error(f"{resp.status} {prov['name']}: {err_text[:80]}")
@@ -586,15 +594,16 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                         "ts": retry_ts, "reason": reason, "log_idx": len(error_log) - 1,
                     }
             retry_count += 1
+            delay = get_retry_delay(retry_count)
             with _log_lock:
                 info = active_retries[retry_id]
                 info["count"] = retry_count
+                info["next_retry"] = time.time() + delay
                 idx = info["log_idx"]
                 if 0 <= idx < len(error_log):
-                    elapsed = int(time.time() - retry_start)
-                    error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retrying #{retry_count} ({elapsed}s)[/yellow]"
+                    error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retry #{retry_count}, next in {delay}s[/yellow]"
             screen_dirty = True
-            await asyncio.sleep(RETRY_DELAY)
+            await asyncio.sleep(delay)
             continue
         except Exception as e:
             log_error(f"{prov['name']}: unexpected {type(e).__name__}: {e}")
@@ -885,9 +894,10 @@ def screen_main():
         for info in active_retries.values():
             idx = info["log_idx"]
             if 0 <= idx < len(error_log):
-                elapsed = int(time.time() - info["start"])
-                dots = "." * ((elapsed % 3) + 1) + " " * (2 - (elapsed % 3))
-                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info.get('provider', 'all')}: {info.get('reason', 'unavailable')}: retrying #{info['count']} ({elapsed}s){dots}[/yellow]"
+                next_retry = info.get("next_retry", 0)
+                countdown = max(0, int(next_retry - time.time()))
+                dots = "." * ((countdown % 3) + 1) + " " * (2 - (countdown % 3))
+                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info.get('provider', 'all')}: {info.get('reason', 'unavailable')}: retry #{info['count']}, next in {countdown}s{dots}[/yellow]"
         log_snapshot = list(error_log[-10:])
     if log_snapshot:
         _p(f"  [bold red]── Log ──[/bold red]")
