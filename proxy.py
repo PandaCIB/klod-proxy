@@ -469,7 +469,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                         err_clean = err_text.strip()
                         if err_clean.lower().startswith("error:"):
                             err_clean = err_clean[6:].strip()
-                        reason = err_clean[:120]
+                        reason = err_clean  # No truncation
                         log_error(f"{prov['name']}: {err_clean}")
 
                         # In single mode, don't try other providers — go straight to retry
