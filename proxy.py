@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -458,9 +459,10 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                             continue
                         return web.Response(status=resp.status, headers={k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS}, body=err_body)
 
-                    is_no_avail = resp.status == 500 and "no avail" in err_text.lower()
-                    is_e015 = "e015" in err_text.lower()
-                    is_retryable = is_no_avail or is_e015 or resp.status == 503
+                    # Check for retryable errors with regex
+                    is_no_accounts = bool(re.search(r"no available.*accounts.*support.*model", err_text, re.IGNORECASE))
+                    is_cooldown = bool(re.search(r"all apis.*in cooldown", err_text, re.IGNORECASE))
+                    is_retryable = is_no_accounts or is_cooldown
 
                     if is_retryable:
                         # Log the actual error from response as-is
