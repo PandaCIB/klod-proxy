@@ -941,7 +941,7 @@ def screen_providers():
         else:
             console.print("  [dim]No providers. Add one to start proxying.[/dim]")
         console.print()
-        console.print(f"  [dim]↑↓ select   1-{len(providers)} jump   Enter actions   [bold bright_cyan]A[/bold bright_cyan] Add   Esc back[/dim]")
+        console.print(f"  [dim]↑↓ select   1-{len(providers)} jump   [bold bright_cyan]A[/bold bright_cyan] Add   [bold bright_green]E[/bold bright_green] Edit   [bold bright_yellow]S[/bold bright_yellow] On/Off   [bold red]D[/bold red] Delete   Esc back[/dim]")
 
         while True:
             key = _readkey()
@@ -953,50 +953,45 @@ def screen_providers():
             elif key in _KEYS_DOWN and providers:
                 sel = (sel + 1) % len(providers)
                 break
-            elif key in (readchar.key.ENTER, "\r", "\n") and providers:
+            elif key.lower() in ("e", "у") and providers:
+                # Edit selected provider
                 p = providers[sel]
-                st_label = "Disable" if p["active"] else "Enable"
-                action = select_option(
-                    f"{p['name']}",
-                    [f"1. Edit", f"2. {st_label}", "3. Delete"],
-                )
-                if action == 0:
-                    # Edit
-                    cls(full=True)
-                    show_cursor()
-                    console.print()
-                    console.print(f"  [bold cyan]Edit: {p['name']}[/bold cyan]")
-                    console.print(f"  [dim]Press Enter to keep current value[/dim]")
-                    console.print()
-                    name = read_line(f"  Name: ", prefill=p["name"]) or p["name"]
-                    url = read_line(f"  URL: ", prefill=p["url"]) or p["url"]
-                    if not url.startswith("http://") and not url.startswith("https://"):
-                        console.print("  [red]URL must start with http:// or https://[/red]")
-                        press_any()
-                    else:
-                        pkey = read_line(f"  Key: ", prefill=p["key"]) or p["key"]
-                        db_edit_provider(p["id"], name, url, pkey)
-                        reload_providers()
-                        console.print("  [green]Updated.[/green]")
-                        press_any()
-                elif action == 1:
-                    # Toggle
-                    db_toggle_provider(p["id"])
+                cls(full=True)
+                show_cursor()
+                console.print()
+                console.print(f"  [bold cyan]Edit: {p['name']}[/bold cyan]")
+                console.print(f"  [dim]Press Enter to keep current value[/dim]")
+                console.print()
+                name = read_line(f"  Name: ", prefill=p["name"]) or p["name"]
+                url = read_line(f"  URL: ", prefill=p["url"]) or p["url"]
+                if not url.startswith("http://") and not url.startswith("https://"):
+                    console.print("  [red]URL must start with http:// or https://[/red]")
+                    press_any()
+                else:
+                    pkey = read_line(f"  Key: ", prefill=p["key"]) or p["key"]
+                    db_edit_provider(p["id"], name, url, pkey)
                     reload_providers()
-                elif action == 2:
-                    # Delete
-                    confirm = select_option(f"Delete {p['name']}?", ["1. Yes", "0. No"], selected=1, enter_only=True)
-                    if confirm == 0:
-                        db_remove_provider(p["id"])
-                        reload_providers()
-                        if sel >= len(providers):
-                            sel = max(0, len(providers) - 1)
+                    console.print("  [green]Updated.[/green]")
+                    press_any()
                 break
-            elif _is_esc(key):
-                return
-            elif key == readchar.key.CTRL_C:
-                raise KeyboardInterrupt
-            elif key.lower() == "a":
+            elif key.lower() in ("s", "ы") and providers:
+                # Toggle selected provider
+                p = providers[sel]
+                db_toggle_provider(p["id"])
+                reload_providers()
+                break
+            elif key.lower() in ("d", "в") and providers:
+                # Delete selected provider
+                p = providers[sel]
+                confirm = select_option(f"Delete {p['name']}?", ["1. Yes", "0. No"], selected=1, enter_only=True)
+                if confirm == 0:
+                    db_remove_provider(p["id"])
+                    reload_providers()
+                    if sel >= len(providers):
+                        sel = max(0, len(providers) - 1)
+                break
+            elif key.lower() in ("a", "ф"):
+                # Add new provider
                 cls(full=True)
                 show_cursor()
                 console.print()
@@ -1020,6 +1015,10 @@ def screen_providers():
                 console.print("  [green]Added.[/green]")
                 press_any()
                 break
+            elif _is_esc(key):
+                return
+            elif key == readchar.key.CTRL_C:
+                raise KeyboardInterrupt
             elif key.isdigit() and providers:
                 num = int(key)
                 if 1 <= num <= len(providers):
