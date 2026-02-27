@@ -1288,7 +1288,8 @@ def screen_settings():
         cur_single = single_provider_id
 
     cur_idx = modes.index(cur_mode) if cur_mode in modes else 0
-    choice = select_option("Mode", modes, selected=cur_idx)
+    title = f"Mode  [dim]|  Current: [/dim][bright_white]{cur_mode}[/bright_white]"
+    choice = select_option(title, modes, selected=cur_idx)
 
     if choice is None:
         return
