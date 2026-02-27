@@ -50,7 +50,7 @@ today_output_tokens = 0
 today_cache_time = 0
 # Активные ретраи: {retry_id: {"provider": str, "count": int, "start": float, "log_idx": int}}
 active_retries: dict[int, dict] = {}
-proxy_mode = "sticky"  # "sticky" | "round-robin" | "single"
+proxy_mode = "failover"  # "failover" | "round-robin" | "single"
 _proxy_online = False
 single_provider_id: int = 0
 client_session: ClientSession = None
@@ -231,6 +231,22 @@ def db_load_by_day(limit: int = 7) -> list[tuple[str, int, int, int]]:
     return rows
 
 
+def db_load_by_hour_today() -> list[tuple[int, int, int, int]]:
+    """Load token usage by hour for today. Returns list of (hour, input_tokens, output_tokens, request_count)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT CAST(strftime('%H', ts) AS INTEGER),
+                   COALESCE(SUM(input_tokens),0),
+                   COALESCE(SUM(output_tokens),0),
+                   COUNT(*)
+            FROM token_log
+            WHERE DATE(ts) = DATE('now')
+            GROUP BY strftime('%H', ts)
+            ORDER BY strftime('%H', ts)
+        """).fetchall()
+    return rows
+
+
 def db_load_by_provider() -> list[tuple[int, str, int, int, int]]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("""
@@ -273,7 +289,7 @@ def get_active_providers() -> list[dict]:
 
 
 def current_provider() -> dict | None:
-    """Return current sticky provider without advancing index."""
+    """Return current failover provider without advancing index."""
     with _state_lock:
         active = get_active_providers()
         if not active:
@@ -410,7 +426,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                     return web.Response(status=503, text=msg)
                 log_error(f"Single provider #{_single_id} not found or inactive", "yellow")
                 return web.Response(status=503, text="Selected provider not available")
-        elif _mode == "sticky":
+        elif _mode == "failover":
             prov = current_provider()
         else:
             prov = next_provider()
@@ -435,26 +451,38 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                             conn.execute("UPDATE providers SET expired = 1 WHERE id = ?", (prov["id"],))
                         log_error(f"{prov['name']}: API key expired", "yellow")
                         screen_dirty = True
-                        advance_provider()
+                        if _mode != "single":
+                            advance_provider()
                         tried += 1
                         if tried < total_active:
                             continue
                         return web.Response(status=resp.status, headers={k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS}, body=err_body)
 
-                    is_retryable = (
-                        (resp.status == 500 and "no avail" in err_text.lower())
-                        or (resp.status == 503)
-                        or ("e015" in err_text.lower())
-                    )
+                    is_no_avail = resp.status == 500 and "no avail" in err_text.lower()
+                    is_e015 = "e015" in err_text.lower()
+                    is_retryable = is_no_avail or is_e015 or resp.status == 503
+
                     if is_retryable:
-                        # Try next provider first
-                        advance_provider()
-                        tried += 1
+                        # Log the actual error from response as-is
+                        err_clean = err_text.strip()
+                        if err_clean.lower().startswith("error:"):
+                            err_clean = err_clean[6:].strip()
+                        reason = err_clean[:120]
+                        log_error(f"{prov['name']}: {err_clean}")
+
+                        # In single mode, don't try other providers — go straight to retry
+                        if _mode == "single":
+                            tried = total_active  # skip provider switching
 
                         if tried < total_active:
-                            log_error(f"{prov['name']}: unavailable, switching to next provider", "yellow")
-                            screen_dirty = True
-                            continue
+                            # Try next provider first
+                            advance_provider()
+                            tried += 1
+
+                            if tried < total_active:
+                                log_error(f"{prov['name']}: {reason}, switching to next provider", "yellow")
+                                screen_dirty = True
+                                continue
 
                         # All providers tried — start retry cycle
                         tried = 0
@@ -468,8 +496,8 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                                 error_log.append("")
                                 _trim_error_log()
                                 active_retries[retry_id] = {
-                                    "provider": "all", "count": 0, "start": retry_start,
-                                    "ts": retry_ts, "log_idx": len(error_log) - 1,
+                                    "provider": prov["name"] if _mode == "single" else "all", "count": 0, "start": retry_start,
+                                    "ts": retry_ts, "reason": reason, "log_idx": len(error_log) - 1,
                                 }
                         retry_count += 1
                         with _log_lock:
@@ -478,7 +506,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                             idx = info["log_idx"]
                             if 0 <= idx < len(error_log):
                                 elapsed = int(time.time() - retry_start)
-                                error_log[idx] = f"[yellow][{info['ts']}] ⟳ all providers unavailable: retry round #{retry_count} ({elapsed}s)[/yellow]"
+                                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retrying #{retry_count} ({elapsed}s)[/yellow]"
                         screen_dirty = True
                         await asyncio.sleep(RETRY_DELAY)
                         continue
@@ -529,12 +557,20 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                     return web.Response(status=resp.status, headers=resp_headers, body=resp_body)
         except (ClientError, asyncio.TimeoutError, OSError) as e:
             # Network error — treat as retryable
-            advance_provider()
-            tried += 1
+            reason = f"Network error ({type(e).__name__})"
+            log_error(f"{prov['name']}: {type(e).__name__}: {e}")
+
+            # In single mode, don't try other providers — go straight to retry
+            if _mode == "single":
+                tried = total_active  # skip provider switching
+
             if tried < total_active:
-                log_error(f"{prov['name']}: {type(e).__name__}, switching to next provider", "yellow")
-                screen_dirty = True
-                continue
+                advance_provider()
+                tried += 1
+                if tried < total_active:
+                    log_error(f"{prov['name']}: {reason}, switching to next provider", "yellow")
+                    screen_dirty = True
+                    continue
             tried = 0
             if retry_count == 0:
                 retry_start = time.time()
@@ -545,8 +581,8 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                     error_log.append("")
                     _trim_error_log()
                     active_retries[retry_id] = {
-                        "provider": "all", "count": 0, "start": retry_start,
-                        "ts": retry_ts, "log_idx": len(error_log) - 1,
+                        "provider": prov["name"] if _mode == "single" else "all", "count": 0, "start": retry_start,
+                        "ts": retry_ts, "reason": reason, "log_idx": len(error_log) - 1,
                     }
             retry_count += 1
             with _log_lock:
@@ -555,7 +591,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 idx = info["log_idx"]
                 if 0 <= idx < len(error_log):
                     elapsed = int(time.time() - retry_start)
-                    error_log[idx] = f"[yellow][{info['ts']}] ⟳ all providers unavailable: retry round #{retry_count} ({elapsed}s)[/yellow]"
+                    error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: {info['reason']}: retrying #{retry_count} ({elapsed}s)[/yellow]"
             screen_dirty = True
             await asyncio.sleep(RETRY_DELAY)
             continue
@@ -718,8 +754,9 @@ def show_cursor():
     sys.stdout.flush()
 
 
-def select_option(title: str, options: list[str], selected: int = 0) -> int | None:
-    """Interactive selector with arrow keys. Returns index or None on Esc."""
+def select_option(title: str, options: list[str], selected: int = 0, enter_only: bool = False) -> int | None:
+    """Interactive selector with arrow keys. Returns index or None on Esc.
+    If enter_only=True, digits only move cursor, confirmation requires Enter."""
     idx = max(0, min(selected, len(options) - 1))
     while True:
         cls(full=True)
@@ -732,7 +769,10 @@ def select_option(title: str, options: list[str], selected: int = 0) -> int | No
             else:
                 console.print(f"  [dim]  {opt}[/dim]")
         console.print()
-        console.print(f"  [dim]↑↓ select   1-{len(options)} jump   Enter confirm   Esc cancel[/dim]")
+        if enter_only:
+            console.print(f"  [dim]↑↓ select   Enter confirm   Esc cancel[/dim]")
+        else:
+            console.print(f"  [dim]↑↓ select   1-{len(options)} jump   Enter confirm   Esc cancel[/dim]")
 
         while True:
             key = _readkey()
@@ -753,7 +793,11 @@ def select_option(title: str, options: list[str], selected: int = 0) -> int | No
             elif key.isdigit():
                 num = int(key)
                 if 1 <= num <= len(options):
-                    return num - 1
+                    if enter_only:
+                        idx = num - 1
+                        break
+                    else:
+                        return num - 1
 
 
 # ─── TUI ─────────────────────────────────────────────────────
@@ -806,8 +850,11 @@ def screen_main():
     _p()
     # Provider statuses
     if _providers:
-        cur = current_provider()
-        cur_id = cur["id"] if cur else None
+        if _proxy_mode == "single":
+            cur_id = _single_id
+        else:
+            cur = current_provider()
+            cur_id = cur["id"] if cur else None
         totals_map = db_load_totals_all()
         for p in _providers:
             if p.get("expired"):
@@ -839,7 +886,7 @@ def screen_main():
             if 0 <= idx < len(error_log):
                 elapsed = int(time.time() - info["start"])
                 dots = "." * ((elapsed % 3) + 1) + " " * (2 - (elapsed % 3))
-                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: retrying #{info['count']} ({elapsed}s){dots}[/yellow]"
+                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info.get('provider', 'all')}: {info.get('reason', 'unavailable')}: retrying #{info['count']} ({elapsed}s){dots}[/yellow]"
         log_snapshot = list(error_log[-10:])
     if log_snapshot:
         _p(f"  [bold red]── Log ──[/bold red]")
@@ -849,10 +896,9 @@ def screen_main():
     _p(f"  [dim]{'-' * 46}[/dim]")
     _p(f"  [bold bright_cyan](1)[/bold bright_cyan] Providers  [dim]|[/dim]  [bold bright_green](2)[/bold bright_green] Stats  [dim]|[/dim]  [bold bright_yellow](3)[/bold bright_yellow] Settings  [dim]|[/dim]  [bold red](0)[/bold red] Clear")
     _p()
-    buf.write("\033[J")
 
     # Один write — ноль мерцания
-    sys.stdout.write("\033[?25l\033[H" + buf.getvalue())
+    sys.stdout.write("\033[?25l\033[H\033[J" + buf.getvalue())
     sys.stdout.flush()
 
 
@@ -872,6 +918,7 @@ def wait_key() -> str:
 
 
 def screen_providers():
+    sel = 0
     while True:
         cls(full=True)
         reload_providers()
@@ -880,94 +927,103 @@ def screen_providers():
         console.print()
         if providers:
             totals_map = db_load_totals_all()
-            table = Table(box=None, padding=(0, 2), show_header=True, show_edge=False)
-            table.add_column("#", style="dim", width=4)
-            table.add_column("Name", style="bold", min_width=15)
-            table.add_column("URL", min_width=30)
-            table.add_column("Key", style="dim")
-            table.add_column("Status")
-            table.add_column("Tokens", justify="right", style="yellow")
-            for p in providers:
+            for i, p in enumerate(providers):
                 masked = p["key"][:8] + "••••" if len(p["key"]) > 8 else p["key"]
                 st = "[green]ON[/green]" if p["active"] else "[red]OFF[/red]"
                 t_inp, t_out = totals_map.get(p["id"], (0, 0))
-                table.add_row(str(p["id"]), p["name"], p["url"], masked, st, fmt(t_inp + t_out))
-            console.print(table)
+                short_url = p["url"].replace("https://", "").replace("http://", "").split("/")[0]
+                line = f"{i+1}. {p['name']}  [dim]{short_url}[/dim]  {st}  [yellow]{fmt(t_inp + t_out)}[/yellow]"
+                if i == sel:
+                    console.print(f"  [bright_yellow]► {line}[/bright_yellow]")
+                else:
+                    console.print(f"  [dim]  {line}[/dim]")
         else:
             console.print("  [dim]No providers. Add one to start proxying.[/dim]")
         console.print()
-        console.print(f"  [bold bright_cyan](1)[/bold bright_cyan] Add   [bold bright_green](2)[/bold bright_green] Edit   [bold red](3)[/bold red] Delete   [bold bright_yellow](4)[/bold bright_yellow] On/Off   [dim]Esc[/dim] Back")
-        console.print()
-        ch = wait_key()
-        if ch == "\x1b":
-            break
-        elif ch == "1":
-            cls(full=True)
-            show_cursor()
-            console.print()
-            console.print(f"  [bold cyan]Add provider[/bold cyan]")
-            console.print()
-            name = read_line("  Name: ")
-            if not name:
+        console.print(f"  [dim]↑↓ select   1-{len(providers)} jump   Enter actions   [bold bright_cyan]A[/bold bright_cyan] Add   Esc back[/dim]")
+
+        while True:
+            key = _readkey()
+            if key is None:
                 continue
-            url = read_line("  API URL: ")
-            if not url:
-                continue
-            if not url.startswith("http://") and not url.startswith("https://"):
-                console.print("  [red]URL must start with http:// or https://[/red]")
-                press_any()
-                continue
-            key = read_line("  API key: ")
-            if not key:
-                continue
-            db_add_provider(name, url, key)
-            reload_providers()
-            console.print("  [green]Added.[/green]")
-            press_any()
-        elif ch == "2":
-            if not providers:
-                continue
-            names = [f"{p['id']}. {p['name']}" for p in providers]
-            choice = select_option("Edit provider", names)
-            if choice is None:
-                continue
-            old = providers[choice]
-            cls(full=True)
-            show_cursor()
-            console.print()
-            console.print(f"  [bold cyan]Edit: {old['name']}[/bold cyan]")
-            console.print(f"  [dim]Press Enter to keep current value[/dim]")
-            console.print()
-            name = read_line(f"  Name: ", prefill=old["name"]) or old["name"]
-            url = read_line(f"  URL: ", prefill=old["url"]) or old["url"]
-            if not url.startswith("http://") and not url.startswith("https://"):
-                console.print("  [red]URL must start with http:// or https://[/red]")
-                press_any()
-                continue
-            key = read_line(f"  Key: ", prefill=old["key"]) or old["key"]
-            db_edit_provider(old["id"], name, url, key)
-            reload_providers()
-            console.print("  [green]Updated.[/green]")
-            press_any()
-        elif ch == "3":
-            if not providers:
-                continue
-            names = [f"{p['id']}. {p['name']}" for p in providers]
-            choice = select_option("Delete provider", names)
-            if choice is None:
-                continue
-            target = providers[choice]
-            confirm = select_option(f"Delete {target['name']}?", ["1. Yes", "0. No"], selected=1)
-            if confirm == 0:
-                db_remove_provider(target["id"])
+            if key in _KEYS_UP and providers:
+                sel = (sel - 1) % len(providers)
+                break
+            elif key in _KEYS_DOWN and providers:
+                sel = (sel + 1) % len(providers)
+                break
+            elif key in (readchar.key.ENTER, "\r", "\n") and providers:
+                p = providers[sel]
+                st_label = "Disable" if p["active"] else "Enable"
+                action = select_option(
+                    f"{p['name']}",
+                    [f"1. Edit", f"2. {st_label}", "3. Delete"],
+                )
+                if action == 0:
+                    # Edit
+                    cls(full=True)
+                    show_cursor()
+                    console.print()
+                    console.print(f"  [bold cyan]Edit: {p['name']}[/bold cyan]")
+                    console.print(f"  [dim]Press Enter to keep current value[/dim]")
+                    console.print()
+                    name = read_line(f"  Name: ", prefill=p["name"]) or p["name"]
+                    url = read_line(f"  URL: ", prefill=p["url"]) or p["url"]
+                    if not url.startswith("http://") and not url.startswith("https://"):
+                        console.print("  [red]URL must start with http:// or https://[/red]")
+                        press_any()
+                    else:
+                        pkey = read_line(f"  Key: ", prefill=p["key"]) or p["key"]
+                        db_edit_provider(p["id"], name, url, pkey)
+                        reload_providers()
+                        console.print("  [green]Updated.[/green]")
+                        press_any()
+                elif action == 1:
+                    # Toggle
+                    db_toggle_provider(p["id"])
+                    reload_providers()
+                elif action == 2:
+                    # Delete
+                    confirm = select_option(f"Delete {p['name']}?", ["1. Yes", "0. No"], selected=1, enter_only=True)
+                    if confirm == 0:
+                        db_remove_provider(p["id"])
+                        reload_providers()
+                        if sel >= len(providers):
+                            sel = max(0, len(providers) - 1)
+                break
+            elif _is_esc(key):
+                return
+            elif key == readchar.key.CTRL_C:
+                raise KeyboardInterrupt
+            elif key.lower() == "a":
+                cls(full=True)
+                show_cursor()
+                console.print()
+                console.print(f"  [bold cyan]Add provider[/bold cyan]")
+                console.print()
+                name = read_line("  Name: ")
+                if not name:
+                    break
+                url = read_line("  API URL: ")
+                if not url:
+                    break
+                if not url.startswith("http://") and not url.startswith("https://"):
+                    console.print("  [red]URL must start with http:// or https://[/red]")
+                    press_any()
+                    break
+                pkey = read_line("  API key: ")
+                if not pkey:
+                    break
+                db_add_provider(name, url, pkey)
                 reload_providers()
-        elif ch == "4":
-            if not providers:
-                continue
-            names = [f"{p['id']}. {p['name']}  {'[green]ON[/green]' if p['active'] else '[red]OFF[/red]'}" for p in providers]
-            choice = select_option("Toggle provider", names)
-            if choice is not None:
-                db_toggle_provider(providers[choice]["id"])
+                console.print("  [green]Added.[/green]")
+                press_any()
+                break
+            elif key.isdigit() and providers:
+                num = int(key)
+                if 1 <= num <= len(providers):
+                    sel = num - 1
+                    break
                 reload_providers()
 
 
@@ -1036,10 +1092,55 @@ def render_yunyi_stats(prov: dict, data: dict):
 
 
 def screen_stats():
+    while True:
+        cls(full=True)
+        console.print()
+        console.print(f"  [bold cyan]Statistics[/bold cyan]")
+        console.print()
+
+        # Quick summary
+        t_inp, t_out = db_load_totals()
+        t_total = t_inp + t_out
+        with _token_lock:
+            today_inp = today_input_tokens
+            today_out = today_output_tokens
+        today_total = today_inp + today_out
+
+        console.print(f"  [dim]All time:[/dim]  [cyan]{fmt(t_inp)}[/cyan] in  [green]{fmt(t_out)}[/green] out  [yellow]{fmt(t_total)}[/yellow] total")
+        console.print(f"  [dim]Today:[/dim]     [cyan]{fmt(today_inp)}[/cyan] in  [green]{fmt(today_out)}[/green] out  [yellow]{fmt(today_total)}[/yellow] total")
+        console.print()
+        console.print(f"  [bold bright_cyan](1)[/bold bright_cyan] Models     — usage by model")
+        console.print(f"  [bold bright_green](2)[/bold bright_green] Providers  — usage by provider + API status")
+        console.print(f"  [bold bright_yellow](3)[/bold bright_yellow] Timeline   — daily & hourly breakdown")
+        console.print(f"  [bold red](0)[/bold red] Reset      — clear all statistics")
+        console.print()
+        console.print(f"  [dim]Esc[/dim] Back")
+        console.print()
+
+        ch = wait_key()
+        if ch == "\x1b":
+            break
+        elif ch == "1":
+            screen_stats_models()
+        elif ch == "2":
+            screen_stats_providers()
+        elif ch == "3":
+            screen_stats_timeline()
+        elif ch == "0":
+            confirm = select_option("Clear all statistics?", ["1. Yes", "0. No"], selected=1, enter_only=True)
+            if confirm == 0:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("DELETE FROM token_log")
+                    conn.commit()
+                cls(full=True)
+                console.print()
+                console.print("  [green]Statistics cleared.[/green]")
+                press_any()
+
+
+def screen_stats_models():
     cls(full=True)
     console.print()
-
-    # По моделям
     models = db_load_by_model()
     t_inp, t_out = db_load_totals()
     t_total = t_inp + t_out
@@ -1063,12 +1164,19 @@ def screen_stats():
     else:
         console.print("  [dim]No data yet.[/dim]")
 
-    # По провайдерам
+    console.print()
+    console.print("  [dim]Press any key...[/dim]")
+    press_any()
+
+
+def screen_stats_providers():
+    cls(full=True)
+    console.print()
     by_prov = db_load_by_provider()
+
+    console.print(f"  [bold cyan]Providers[/bold cyan]")
+    console.print()
     if by_prov:
-        console.print()
-        console.print(f"  [bold cyan]Providers[/bold cyan]")
-        console.print()
         max_prov = max(r[2] + r[3] for r in by_prov)
         table = Table(box=None, padding=(0, 2), show_header=True, show_edge=False)
         table.add_column("Provider", style="bold", min_width=15)
@@ -1080,24 +1188,8 @@ def screen_stats():
         for _, name, inp, out, count in by_prov:
             table.add_row(name, fmt(inp), fmt(out), fmt(inp + out), str(count), bar(inp + out, max_prov))
         console.print(table)
-
-    # По дням
-    days = db_load_by_day(7)
-    if days:
-        console.print()
-        console.print(f"  [bold cyan]Last 7 days[/bold cyan]")
-        console.print()
-        max_day = max(r[1] + r[2] for r in days)
-        table = Table(box=None, padding=(0, 2), show_header=True, show_edge=False)
-        table.add_column("Date", style="bold", min_width=12)
-        table.add_column("Input", justify="right", style="cyan")
-        table.add_column("Output", justify="right", style="green")
-        table.add_column("Total", justify="right", style="yellow")
-        table.add_column("Reqs", justify="right", style="dim")
-        table.add_column("", min_width=20)
-        for date, inp, out, count in days:
-            table.add_row(date, fmt(inp), fmt(out), fmt(inp + out), str(count), bar(inp + out, max_day))
-        console.print(table)
+    else:
+        console.print("  [dim]No data yet.[/dim]")
 
     # Yunyi API stats
     yunyi_provs = [p for p in providers if is_yunyi(p)]
@@ -1117,7 +1209,6 @@ def screen_stats():
         for t in threads:
             t.join(timeout=15)
         # Re-render after fetch
-        # Move cursor back over "Fetching..." line
         sys.stdout.write("\033[A\033[K")
         sys.stdout.flush()
         for p in yunyi_provs:
@@ -1127,6 +1218,52 @@ def screen_stats():
             else:
                 console.print(f"    [bright_white]{p['name']}[/bright_white]  [red]unavailable[/red]")
             console.print()
+
+    console.print()
+    console.print("  [dim]Press any key...[/dim]")
+    press_any()
+
+
+def screen_stats_timeline():
+    cls(full=True)
+    console.print()
+
+    # Last 7 days
+    days = db_load_by_day(7)
+    console.print(f"  [bold cyan]Last 7 days[/bold cyan]")
+    console.print()
+    if days:
+        max_day = max(r[1] + r[2] for r in days)
+        table = Table(box=None, padding=(0, 2), show_header=True, show_edge=False)
+        table.add_column("Date", style="bold", min_width=12)
+        table.add_column("Input", justify="right", style="cyan")
+        table.add_column("Output", justify="right", style="green")
+        table.add_column("Total", justify="right", style="yellow")
+        table.add_column("Reqs", justify="right", style="dim")
+        table.add_column("", min_width=20)
+        for date, inp, out, count in days:
+            table.add_row(date, fmt(inp), fmt(out), fmt(inp + out), str(count), bar(inp + out, max_day))
+        console.print(table)
+    else:
+        console.print("  [dim]No data yet.[/dim]")
+
+    # Today by hour
+    hours = db_load_by_hour_today()
+    if hours:
+        console.print()
+        console.print(f"  [bold cyan]Today by hour[/bold cyan]")
+        console.print()
+        max_hour = max(r[1] + r[2] for r in hours)
+        table = Table(box=None, padding=(0, 2), show_header=True, show_edge=False)
+        table.add_column("Hour", style="bold", width=6)
+        table.add_column("Input", justify="right", style="cyan")
+        table.add_column("Output", justify="right", style="green")
+        table.add_column("Total", justify="right", style="yellow")
+        table.add_column("Reqs", justify="right", style="dim")
+        table.add_column("", min_width=20)
+        for hour, inp, out, count in hours:
+            table.add_row(f"{hour:02d}:00", fmt(inp), fmt(out), fmt(inp + out), str(count), bar(inp + out, max_hour))
+        console.print(table)
 
     console.print()
     console.print("  [dim]Press any key...[/dim]")
@@ -1143,8 +1280,8 @@ def screen_settings():
         with _state_lock:
             _mode = proxy_mode
             _single_id = single_provider_id
-        if _mode == "sticky":
-            mode_label = "[green]sticky[/green]"
+        if _mode == "failover":
+            mode_label = "[green]failover[/green]"
         elif _mode == "round-robin":
             mode_label = "[cyan]round-robin[/cyan]"
         else:
@@ -1154,7 +1291,7 @@ def screen_settings():
         console.print(f"  [bold bright_cyan](1)[/bold bright_cyan] Port       [bold]{LOCAL_PORT}[/bold]")
         console.print(f"  [bold bright_green](2)[/bold bright_green] Mode       {mode_label}")
         console.print()
-        console.print(f"  [dim]  sticky      — один провайдер, пока работает. При ошибке — следующий[/dim]")
+        console.print(f"  [dim]  failover    — один провайдер, пока работает. При ошибке — следующий[/dim]")
         console.print(f"  [dim]  round-robin — каждый запрос к следующему провайдеру по кругу[/dim]")
         console.print(f"  [dim]  single      — только один конкретный провайдер[/dim]")
         console.print()
@@ -1171,7 +1308,7 @@ def screen_settings():
                 console.print(f"  [yellow]Saved port {val}. Restart proxy to apply.[/yellow]")
                 press_any()
         elif ch == "2":
-            modes = ["sticky", "round-robin", "single"]
+            modes = ["failover", "round-robin", "single"]
             with _state_lock:
                 cur_mode = proxy_mode
                 cur_single = single_provider_id
@@ -1209,10 +1346,13 @@ def main_headless():
     reload_providers()
     old_sticky = db_get_setting("sticky_mode", "")
     if old_sticky and not db_get_setting("proxy_mode", ""):
-        db_set_setting("proxy_mode", "sticky" if old_sticky == "1" else "round-robin")
-    proxy_mode = db_get_setting("proxy_mode", "sticky")
-    if proxy_mode not in ("sticky", "round-robin", "single"):
-        proxy_mode = "sticky"
+        db_set_setting("proxy_mode", "failover" if old_sticky == "1" else "round-robin")
+    proxy_mode = db_get_setting("proxy_mode", "failover")
+    if proxy_mode == "sticky":
+        proxy_mode = "failover"
+        db_set_setting("proxy_mode", "failover")
+    if proxy_mode not in ("failover", "round-robin", "single"):
+        proxy_mode = "failover"
     single_provider_id = int(db_get_setting("single_provider_id", "0"))
     LOCAL_PORT = int(db_get_setting("port", str(LOCAL_PORT)))
     total_input_tokens, total_output_tokens = db_load_totals()
@@ -1253,10 +1393,13 @@ def main():
     # Миграция: sticky_mode → proxy_mode
     old_sticky = db_get_setting("sticky_mode", "")
     if old_sticky and not db_get_setting("proxy_mode", ""):
-        db_set_setting("proxy_mode", "sticky" if old_sticky == "1" else "round-robin")
-    proxy_mode = db_get_setting("proxy_mode", "sticky")
-    if proxy_mode not in ("sticky", "round-robin", "single"):
-        proxy_mode = "sticky"
+        db_set_setting("proxy_mode", "failover" if old_sticky == "1" else "round-robin")
+    proxy_mode = db_get_setting("proxy_mode", "failover")
+    if proxy_mode == "sticky":
+        proxy_mode = "failover"
+        db_set_setting("proxy_mode", "failover")
+    if proxy_mode not in ("failover", "round-robin", "single"):
+        proxy_mode = "failover"
     single_provider_id = int(db_get_setting("single_provider_id", "0"))
     LOCAL_PORT = int(db_get_setting("port", str(LOCAL_PORT)))
 
