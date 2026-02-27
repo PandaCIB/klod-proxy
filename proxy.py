@@ -1285,11 +1285,13 @@ def screen_settings():
     while True:
         cls(full=True)
         console.print()
-        console.print(f"  [bold yellow]Settings[/bold yellow]")
+        console.print(f"  [bold yellow]Proxy Mode[/bold yellow]")
         console.print()
         with _state_lock:
             _mode = proxy_mode
             _single_id = single_provider_id
+
+        # Show current mode
         if _mode == "failover-robin":
             mode_label = "[green]failover-robin[/green]"
         elif _mode == "round-robin":
@@ -1298,53 +1300,60 @@ def screen_settings():
             sp = next((p for p in providers if p["id"] == _single_id), None)
             sp_name = sp["name"] if sp else "?"
             mode_label = f"[yellow]single ({sp_name})[/yellow]"
-        console.print(f"  [bold bright_cyan](1)[/bold bright_cyan] Port       [bold]{LOCAL_PORT}[/bold]")
-        console.print(f"  [bold bright_green](2)[/bold bright_green] Mode       {mode_label}")
+
+        console.print(f"  Current: {mode_label}")
         console.print()
-        console.print(f"  [dim]  failover-robin — один провайдер, пока работает. При ошибке — следующий[/dim]")
-        console.print(f"  [dim]  round-robin — каждый запрос к следующему провайдеру по кругу[/dim]")
-        console.print(f"  [dim]  single      — только один конкретный провайдер[/dim]")
+
+        # Mode options with direct keys
+        marker1 = "[green]●[/green]" if _mode == "failover-robin" else "[dim]○[/dim]"
+        marker2 = "[cyan]●[/cyan]" if _mode == "round-robin" else "[dim]○[/dim]"
+        marker3 = "[yellow]●[/yellow]" if _mode == "single" else "[dim]○[/dim]"
+
+        console.print(f"  {marker1} [bold bright_cyan](1)[/bold bright_cyan] failover-robin")
+        console.print(f"      [dim]один провайдер, пока работает. При ошибке — следующий[/dim]")
+        console.print()
+        console.print(f"  {marker2} [bold bright_green](2)[/bold bright_green] round-robin")
+        console.print(f"      [dim]каждый запрос к следующему провайдеру по кругу[/dim]")
+        console.print()
+        console.print(f"  {marker3} [bold bright_yellow](3)[/bold bright_yellow] single")
+        console.print(f"      [dim]только один конкретный провайдер[/dim]")
         console.print()
         console.print(f"  [dim]Esc[/dim] Back")
         console.print()
+
         ch = wait_key()
         if ch == "\x1b":
             break
         elif ch == "1":
-            show_cursor()
-            val = read_line("  New port: ")
-            if val.isdigit():
-                db_set_setting("port", val)
-                console.print(f"  [yellow]Saved port {val}. Restart proxy to apply.[/yellow]")
-                press_any()
-        elif ch == "2":
-            modes = ["failover-robin", "round-robin", "single"]
             with _state_lock:
-                cur_mode = proxy_mode
+                proxy_mode = "failover-robin"
+            db_set_setting("proxy_mode", "failover-robin")
+        elif ch == "2":
+            with _state_lock:
+                proxy_mode = "round-robin"
+            db_set_setting("proxy_mode", "round-robin")
+        elif ch == "3":
+            # Single mode - need to select provider
+            active = get_active_providers()
+            if not active:
+                cls(full=True)
+                console.print()
+                console.print("  [red]No active providers.[/red]")
+                press_any()
+                continue
+            names = [p["name"] for p in active]
+            with _state_lock:
                 cur_single = single_provider_id
-            cur_idx = modes.index(cur_mode) if cur_mode in modes else 0
-            choice = select_option("Select mode", modes, selected=cur_idx)
-            if choice is not None:
-                new_mode = modes[choice]
-                if new_mode == "single":
-                    active = get_active_providers()
-                    if not active:
-                        cls(full=True)
-                        console.print()
-                        console.print("  [red]No active providers.[/red]")
-                        press_any()
-                        continue
-                    names = [p["name"] for p in active]
-                    cur_sp = next((i for i, p in enumerate(active) if p["id"] == cur_single), 0)
-                    sp_choice = select_option("Select provider", names, selected=cur_sp)
-                    if sp_choice is None:
-                        continue
-                    cur_single = active[sp_choice]["id"]
-                    db_set_setting("single_provider_id", str(cur_single))
-                with _state_lock:
-                    proxy_mode = new_mode
-                    single_provider_id = cur_single
-                db_set_setting("proxy_mode", new_mode)
+            cur_sp = next((i for i, p in enumerate(active) if p["id"] == cur_single), 0)
+            sp_choice = select_option("Select provider", names, selected=cur_sp)
+            if sp_choice is None:
+                continue
+            new_single_id = active[sp_choice]["id"]
+            with _state_lock:
+                proxy_mode = "single"
+                single_provider_id = new_single_id
+            db_set_setting("proxy_mode", "single")
+            db_set_setting("single_provider_id", str(new_single_id))
 
 
 # ─── Headless ─────────────────────────────────────────────────
