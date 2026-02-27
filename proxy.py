@@ -455,9 +455,13 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                     # Extract message from JSON if possible
                     try:
                         err_json = json.loads(err_text)
-                        if isinstance(err_json, dict) and "error" in err_json:
-                            if isinstance(err_json["error"], dict) and "message" in err_json["error"]:
+                        if isinstance(err_json, dict):
+                            # Try nested structure: {"error": {"message": "..."}}
+                            if "error" in err_json and isinstance(err_json["error"], dict) and "message" in err_json["error"]:
                                 err_text = err_json["error"]["message"]
+                            # Try flat structure: {"message": "..."}
+                            elif "message" in err_json:
+                                err_text = err_json["message"]
                     except (json.JSONDecodeError, KeyError, TypeError):
                         pass  # Keep original err_text
 
